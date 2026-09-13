@@ -26,14 +26,17 @@ jobs:
 
       - name: Run GSoC compiler
         env:
-          GITHUB_TOKEN: ${{ secrets.GSOC_GITHUB_TOKEN }}
-          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          ITHUB_TOKEN: ${{ secrets.ITHUB_TOKEN }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          MIN_TIME_MS: ${{secrets.MIN_TIME_MS}}
+          USE_OLD_RECORDS: ${{secrets.USE_OLD_RECORDS}}
+          WRITE_LEGACY_JSON: ${{secrets.WRITE_LEGACY_JSON}}
 
           USE_OLD_RECORDS: false
           WRITE_LEGACY_JSON: true
           ACTIVITY_REPO_LIMIT: 3
-          GITHUB_MIN_TIME_MS: 2000
-          GITHUB_MAX_CONCURRENT: 1
+          ITHUBMIN_TIME_MS: 2000
+          ITHUB_MAX_CONCURRENT: 1
           MAX_GITHUB_RETRIES: 2
 
         run: node index.js
