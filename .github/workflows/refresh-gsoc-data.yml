@@ -32,8 +32,6 @@ jobs:
           USE_OLD_RECORDS: ${{secrets.USE_OLD_RECORDS}}
           WRITE_LEGACY_JSON: ${{secrets.WRITE_LEGACY_JSON}}
 
-          USE_OLD_RECORDS: false
-          WRITE_LEGACY_JSON: true
           ACTIVITY_REPO_LIMIT: 3
           ITHUBMIN_TIME_MS: 2000
           ITHUB_MAX_CONCURRENT: 1
