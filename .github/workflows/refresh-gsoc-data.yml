@@ -3,7 +3,7 @@ name: Refresh GSoC Data
 on:
   push:
     branches:
-      - develop
+      - prod
 
   workflow_dispatch:
 
