@@ -1,0 +1,39 @@
+name: Refresh GSoC Data
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run GSoC compiler
+        env:
+          GITHUB_TOKEN: ${{ secrets.GSOC_GITHUB_TOKEN }}
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+
+          USE_OLD_RECORDS: false
+          WRITE_LEGACY_JSON: true
+          ACTIVITY_REPO_LIMIT: 3
+          GITHUB_MIN_TIME_MS: 2000
+          GITHUB_MAX_CONCURRENT: 1
+          MAX_GITHUB_RETRIES: 2
+
+        run: node index.js

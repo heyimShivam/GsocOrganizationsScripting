@@ -15,7 +15,7 @@ const __dirname = path.dirname(__filename);
 // Configuration
 // -----------------------------------------------------------------------------
 
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN?.trim();
+const GITHUB_TOKEN = process.env.ITHUB_TOKEN?.trim();
 if (!GITHUB_TOKEN) {
     throw new Error('GITHUB_TOKEN is required. Put it in .env or your CI secrets.');
 }
@@ -24,8 +24,8 @@ const GSOC_DIR = path.resolve(__dirname, process.env.GSOC_DIR || './GSoC');
 const USE_OLD_RECORDS = parseBoolean(process.env.USE_OLD_RECORDS, false);
 const WRITE_LEGACY_JSON = parseBoolean(process.env.WRITE_LEGACY_JSON, true);
 const ACTIVITY_REPO_LIMIT = toPositiveInteger(process.env.ACTIVITY_REPO_LIMIT, 3);
-const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.GITHUB_MIN_TIME_MS, 2000);
-const GITHUB_MAX_CONCURRENT = toPositiveInteger(process.env.GITHUB_MAX_CONCURRENT, 1);
+const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.ITHUBMIN_TIME_MS, 2000);
+const GITHUB_MAX_CONCURRENT = toPositiveInteger(process.env.ITHUB_MAX_CONCURRENT, 1);
 const MAX_GITHUB_RETRIES = toNonNegativeInteger(process.env.MAX_GITHUB_RETRIES, 3);
 
 // Set to 0 to fetch every page.
@@ -148,9 +148,9 @@ function createDatabasePool() {
     const sslEnabled = parseBoolean(process.env.DB_SSL, false);
     const ssl = sslEnabled ? { rejectUnauthorized: false } : false;
 
-    if (process.env.DATABASE_URL) {
+    if (process.env.NEON_DATABASE_URL) {
         return new Pool({
-            connectionString: process.env.DATABASE_URL,
+            connectionString: process.env.NEON_DATABASE_URL,
             ssl
         });
     }
@@ -158,7 +158,7 @@ function createDatabasePool() {
     return new Pool({
         host: process.env.DB_HOST || 'localhost',
         port: Number(process.env.DB_PORT || 5432),
-        database: process.env.DB_NAME || 'gsoc_hub',
+        database: process.env.DB_NAME || 'gsoc',
         user: process.env.DB_USER || 'postgres',
         password: process.env.DB_PASSWORD,
         ssl
