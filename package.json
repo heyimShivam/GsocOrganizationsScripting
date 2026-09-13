@@ -1,0 +1,21 @@
+{
+  "name": "data-compliation",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "heyimshivam",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bottleneck": "^2.19.5",
+    "dotenv": "^16.5.0",
+    "fs": "^0.0.1-security",
+    "pg": "^8.23.0",
+    "striptags": "^3.2.0",
+    "xmlbuilder2": "^3.1.1"
+  }
+}
