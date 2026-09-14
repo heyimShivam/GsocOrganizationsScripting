@@ -1238,36 +1238,93 @@ async function insertGithubStats(client, organizationId, totalCommits) {
 }
 
 async function persistOrganization(client, org) {
+    console.log(`[${org.name}] Starting organization upsert`);
     const organizationId = await upsertOrganization(client, org);
+    console.log(`[${org.name}] Organization upserted: ${organizationId}`);
 
+    console.log(`[${org.name}] Adding contacts`);
     await replaceOrganizationContacts(client, organizationId, org);
+
+    console.log(`[${org.name}] Adding years and projects`);
     await replaceOrganizationYearsAndProjects(client, organizationId, org);
+
+    console.log(`[${org.name}] Adding taxonomies`);
     await replaceTaxonomies(client, organizationId, org);
-    await replaceRepositories(client, organizationId, org.repositories || []);
-    await replaceContributors(client, organizationId, org.contributorsDetails || []);
-    await insertGithubStats(client, organizationId, org.totalCommits || 0);
+
+    console.log(`[${org.name}] Adding repositories`);
+    await replaceRepositories(
+        client,
+        organizationId,
+        org.repositories || []
+    );
+
+    console.log(`[${org.name}] Adding contributors`);
+    await replaceContributors(
+        client,
+        organizationId,
+        org.contributorsDetails || []
+    );
+
+    console.log(`[${org.name}] Adding GitHub stats`);
+    await insertGithubStats(
+        client,
+        organizationId,
+        org.totalCommits || 0
+    );
+
+    console.log(`[${org.name}] Organization persistence completed`);
 
     return organizationId;
 }
 
+// -----------------------------------------------------------------------------
+// CHANGED: each organization is now persisted in its OWN transaction instead
+// of all 530 orgs sharing a single BEGIN/COMMIT. This keeps individual
+// transactions short (lighter on Neon's free-tier compute/connection limits)
+// and means a failure on one org no longer rolls back every org that already
+// succeeded. The one connection (`client`) is still reused for the whole run
+// to avoid 530 separate connect/disconnect round trips.
+// -----------------------------------------------------------------------------
 async function persistAllOrganizations(organizations) {
     const client = await pool.connect();
+    let processed = 0;
+    const failures = [];
 
     try {
-        await client.query('BEGIN');
-
-        let processed = 0;
         for (const org of organizations) {
-            await persistOrganization(client, org);
-            processed++;
+            try {
+                await client.query('BEGIN');
 
-            if (processed % 25 === 0 || processed === organizations.length) {
-                console.log(`Database: ${processed}/${organizations.length} organizations persisted.`);
+                console.log(
+                    `\n[DB START ${processed + 1}/${organizations.length}] Adding organization: ${org.name}`
+                );
+
+                console.log('GitHub ID:', org.githubID);
+                console.log('Repositories:', org.repositories?.length || 0);
+                console.log('Contributors:', org.contributorsDetails?.length || 0);
+                console.log('Years:', org.year?.length || 0);
+
+                await persistOrganization(client, org);
+
+                await client.query('COMMIT');
+                processed++;
+
+                console.log(
+                    `[DB DONE ${processed}/${organizations.length}] Successfully added: ${org.name}`
+                );
+            } catch (error) {
+                await client.query('ROLLBACK');
+                console.error(`[DB FAILED] ${org.name}: ${error.message}`);
+                failures.push({ name: org.name, error: error.message });
+                // Continue with the next org instead of aborting the whole run.
             }
         }
 
         // Remove global GitHub records no longer linked to any organization.
         // This keeps repeat refreshes from leaving stale orphan rows.
+        // Runs in its own small transaction, once, after all orgs are done.
+        await client.query('BEGIN');
+
         await client.query(`
             DELETE FROM repositories r
             WHERE NOT EXISTS (
@@ -1288,11 +1345,17 @@ async function persistAllOrganizations(organizations) {
 
         await client.query('COMMIT');
     } catch (error) {
-        await client.query('ROLLBACK');
+        try {
+            await client.query('ROLLBACK');
+        } catch {
+            // ignore rollback errors here; original error is what matters
+        }
         throw error;
     } finally {
         client.release();
     }
+
+    return { processed, failures };
 }
 
 // -----------------------------------------------------------------------------
@@ -1416,7 +1479,17 @@ async function compileData() {
             `Canonical identity merge: ${enrichedOrganizations.length} -> ${canonicalOrganizations.length} organizations.`
         );
 
-        await persistAllOrganizations(canonicalOrganizations);
+        // CHANGED: persistAllOrganizations now commits per-organization and
+        // returns how many succeeded plus any per-org failures, instead of
+        // an all-or-nothing single transaction.
+        const { processed, failures } = await persistAllOrganizations(canonicalOrganizations);
+
+        if (failures.length > 0) {
+            console.warn(`\n${failures.length} organization(s) failed to persist:`);
+            for (const failure of failures) {
+                console.warn(`  - ${failure.name}: ${failure.error}`);
+            }
+        }
 
         await writeLegacyOutputs(
             canonicalOrganizations,
@@ -1429,12 +1502,20 @@ async function compileData() {
             caches
         );
 
-        await finishSyncRun(syncRunId, 'SUCCESS', canonicalOrganizations.length);
+        await finishSyncRun(
+            syncRunId,
+            'SUCCESS',
+            processed,
+            failures.length > 0 ? JSON.stringify(failures).slice(0, 10000) : null
+        );
 
         console.log('\n========================================');
         console.log('GSoC Hub refresh completed successfully.');
         console.log(`Years: ${gsocYears[0]}-${gsocYears[gsocYears.length - 1]}`);
-        console.log(`Organizations: ${canonicalOrganizations.length}`);
+        console.log(`Organizations processed: ${processed}/${canonicalOrganizations.length}`);
+        if (failures.length > 0) {
+            console.log(`Organizations failed: ${failures.length}`);
+        }
         console.log('========================================');
     } catch (error) {
         console.error('\nGSoC Hub refresh failed:');
