@@ -28,10 +28,10 @@ jobs:
         env:
           ITHUB_TOKEN: ${{ secrets.ITHUB_TOKEN }}
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          MIN_TIME_MS: ${{secrets.MIN_TIME_MS}}
           USE_OLD_RECORDS: ${{secrets.USE_OLD_RECORDS}}
           WRITE_LEGACY_JSON: ${{secrets.WRITE_LEGACY_JSON}}
 
+          MIN_TIME_MS: 1000
           ACTIVITY_REPO_LIMIT: 3
           ITHUBMIN_TIME_MS: 1000
           ITHUB_MAX_CONCURRENT: 1
