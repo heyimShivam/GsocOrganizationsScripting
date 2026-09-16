@@ -745,7 +745,20 @@ function mergeCanonicalOrganization(base, incoming) {
 function canonicalizeOrganizations(organizations) {
     const map = new Map();
 
-    for (const org of organiz// -----------------------------------------------------------------------------
+    for (const org of organizations) {
+        const key = databaseIdentityKey(org);
+
+        if (!map.has(key)) {
+            map.set(key, structuredClone(org));
+        } else {
+            mergeCanonicalOrganization(map.get(key), org);
+        }
+    }
+
+    return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// -----------------------------------------------------------------------------
 // PostgreSQL persistence
 // Bulk/resumable persistence lives in db-persistence.js.
 // -----------------------------------------------------------------------------
@@ -755,378 +768,378 @@ function canonicalizeOrganizations(organizations) {
 // -----------------------------------------------------------------------------
 
 async function clearGeneratedDetailJsonFiles() {
-            try {
-                const entries = await fs.readdir(LEGACY_DETAILS_DIR, { withFileTypes: true });
-                await Promise.all(
-                    entries
-                        .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
-                        .map(entry => fs.unlink(path.join(LEGACY_DETAILS_DIR, entry.name)))
-                );
-            } catch (error) {
-                if (error.code !== 'ENOENT') throw error;
-            }
+    try {
+        const entries = await fs.readdir(LEGACY_DETAILS_DIR, { withFileTypes: true });
+        await Promise.all(
+            entries
+                .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
+                .map(entry => fs.unlink(path.join(LEGACY_DETAILS_DIR, entry.name)))
+        );
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+    }
+}
+
+async function writeLegacyOutputs(organizations, gsocYears, sourceTotals, caches) {
+    if (!WRITE_LEGACY_JSON) return;
+
+    await fs.mkdir(LEGACY_DETAILS_DIR, { recursive: true });
+    await fs.mkdir(LEGACY_COMPILED_DIR, { recursive: true });
+    await clearGeneratedDetailJsonFiles();
+
+    const summary = [];
+
+    for (const org of organizations) {
+        const detailCopy = structuredClone(org);
+        delete detailCopy.totalCommits; // preserve your public detailed-JSON shape
+
+        await writeJsonFile(
+            path.join(LEGACY_DETAILS_DIR, detailFileName(detailCopy)),
+            detailCopy
+        );
+
+        summary.push({
+            name: org.name,
+            image_url: org.image_url,
+            image_background_color: org.image_background_color,
+            description: org.description,
+            url: org.url,
+            category: org.category,
+            topics: org.topics,
+            technologies: org.technologies,
+            year: org.year,
+            githubID: githubIdForJson(org.githubID),
+            activeOrg: Boolean(org.activeOrg)
+        });
+    }
+
+    await writeJsonFile(CACHE_FILES.commits, caches.commits);
+    await writeJsonFile(CACHE_FILES.contributors, caches.contributors);
+    await writeJsonFile(CACHE_FILES.repos, caches.repos);
+    await writeJsonFile(CACHE_FILES.orgNames, caches.orgNames);
+
+    await writeJsonFile(
+        path.join(LEGACY_COMPILED_DIR, 'organizations.json'),
+        {
+            orgData: summary,
+            totalGsocYears: gsocYears,
+            totalCategories: sourceTotals.categories,
+            totalTopics: sourceTotals.topics,
+            totalTechnologies: sourceTotals.technologies
+        }
+    );
+
+    console.log('Legacy JSON files saved.');
+}
+
+// -----------------------------------------------------------------------------
+// Main compile + refresh pipeline
+// -----------------------------------------------------------------------------
+
+async function loadCaches() {
+    return {
+        orgNames: await readJsonFile(CACHE_FILES.orgNames, {}),
+        repos: await readJsonFile(CACHE_FILES.repos, {}),
+        contributors: await readJsonFile(CACHE_FILES.contributors, {}),
+        commits: await readJsonFile(CACHE_FILES.commits, {})
+    };
+}
+
+async function compileDataFetch() {
+    let syncRunId = null;
+    let canonicalOrganizations = [];
+
+    try {
+        await pool.query('SELECT 1;');
+        console.log('PostgreSQL connection successful.');
+
+        syncRunId = await createSyncRun();
+
+        const gsocYears = await discoverGsocYears();
+        console.log(`Discovered GSoC years dynamically: ${gsocYears.join(', ')}`);
+
+        const compiledOrgsData = new OrganizationData();
+        await fetchOrganizationsData(compiledOrgsData, gsocYears);
+
+        const sortedCompiledOrgsData = objectSorter(compiledOrgsData.parentOrganizationsData);
+        const organizations = Object.values(sortedCompiledOrgsData);
+
+        console.log(`Historical compiler produced ${organizations.length} candidate organizations.`);
+
+        const caches = await loadCaches();
+        const runtimeGithubCache = new Map();
+        const enrichedOrganizations = [];
+
+        // IMPORTANT: GitHub enrichment remains exactly sequential.
+        for (let i = 0; i < organizations.length; i++) {
+            const org = organizations[i];
+            console.log(`\n[${i + 1}/${organizations.length}] Enriching ${org.name}`);
+
+            enrichedOrganizations.push(
+                await enrichOrganizationWithGithub(org, caches, runtimeGithubCache)
+            );
         }
 
-    async function writeLegacyOutputs(organizations, gsocYears, sourceTotals, caches) {
-        if (!WRITE_LEGACY_JSON) return;
+        canonicalOrganizations = canonicalizeOrganizations(enrichedOrganizations);
 
-        await fs.mkdir(LEGACY_DETAILS_DIR, { recursive: true });
-        await fs.mkdir(LEGACY_COMPILED_DIR, { recursive: true });
-        await clearGeneratedDetailJsonFiles();
+        console.log(
+            `Canonical identity merge: ${enrichedOrganizations.length} -> ` +
+            `${canonicalOrganizations.length} organizations.`
+        );
 
-        const summary = [];
+        const outputDir = path.resolve(__dirname, 'output');
+        const batchDir = path.join(outputDir, 'batches');
 
-        for (const org of organizations) {
-            const detailCopy = structuredClone(org);
-            delete detailCopy.totalCommits; // preserve your public detailed-JSON shape
+        await fs.rm(outputDir, { recursive: true, force: true });
+        await fs.mkdir(batchDir, { recursive: true });
 
-            await writeJsonFile(
-                path.join(LEGACY_DETAILS_DIR, detailFileName(detailCopy)),
-                detailCopy
-            );
+        const batchSize = toPositiveInteger(process.env.DB_BATCH_SIZE, 100);
+        const batches = [];
 
-            summary.push({
-                name: org.name,
-                image_url: org.image_url,
-                image_background_color: org.image_background_color,
-                description: org.description,
-                url: org.url,
-                category: org.category,
-                topics: org.topics,
-                technologies: org.technologies,
-                year: org.year,
-                githubID: githubIdForJson(org.githubID),
-                activeOrg: Boolean(org.activeOrg)
+        for (let i = 0; i < canonicalOrganizations.length; i += batchSize) {
+            const batch = canonicalOrganizations.slice(i, i + batchSize);
+            const batchNumber = Math.floor(i / batchSize);
+            const fileName = `batch-${String(batchNumber).padStart(3, '0')}.json`;
+
+            await writeJsonFile(path.join(batchDir, fileName), batch);
+
+            batches.push({
+                file: fileName,
+                count: batch.length
             });
         }
 
-        await writeJsonFile(CACHE_FILES.commits, caches.commits);
-        await writeJsonFile(CACHE_FILES.contributors, caches.contributors);
-        await writeJsonFile(CACHE_FILES.repos, caches.repos);
-        await writeJsonFile(CACHE_FILES.orgNames, caches.orgNames);
+        // The complete enriched dataset is useful for the final output stage and
+        // gives us a reproducible snapshot independent of the DB jobs.
+        await writeJsonFile(
+            path.join(outputDir, 'enriched-organizations.json'),
+            canonicalOrganizations
+        );
 
         await writeJsonFile(
-            path.join(LEGACY_COMPILED_DIR, 'organizations.json'),
+            path.join(outputDir, 'metadata.json'),
             {
-                orgData: summary,
-                totalGsocYears: gsocYears,
-                totalCategories: sourceTotals.categories,
-                totalTopics: sourceTotals.topics,
-                totalTechnologies: sourceTotals.technologies
-            }
-        );
-
-        console.log('Legacy JSON files saved.');
-    }
-
-    // -----------------------------------------------------------------------------
-    // Main compile + refresh pipeline
-    // -----------------------------------------------------------------------------
-
-    async function loadCaches() {
-        return {
-            orgNames: await readJsonFile(CACHE_FILES.orgNames, {}),
-            repos: await readJsonFile(CACHE_FILES.repos, {}),
-            contributors: await readJsonFile(CACHE_FILES.contributors, {}),
-            commits: await readJsonFile(CACHE_FILES.commits, {})
-        };
-    }
-
-    async function compileDataFetch() {
-        let syncRunId = null;
-        let canonicalOrganizations = [];
-
-        try {
-            await pool.query('SELECT 1;');
-            console.log('PostgreSQL connection successful.');
-
-            syncRunId = await createSyncRun();
-
-            const gsocYears = await discoverGsocYears();
-            console.log(`Discovered GSoC years dynamically: ${gsocYears.join(', ')}`);
-
-            const compiledOrgsData = new OrganizationData();
-            await fetchOrganizationsData(compiledOrgsData, gsocYears);
-
-            const sortedCompiledOrgsData = objectSorter(compiledOrgsData.parentOrganizationsData);
-            const organizations = Object.values(sortedCompiledOrgsData);
-
-            console.log(`Historical compiler produced ${organizations.length} candidate organizations.`);
-
-            const caches = await loadCaches();
-            const runtimeGithubCache = new Map();
-            const enrichedOrganizations = [];
-
-            // IMPORTANT: GitHub enrichment remains exactly sequential.
-            for (let i = 0; i < organizations.length; i++) {
-                const org = organizations[i];
-                console.log(`\n[${i + 1}/${organizations.length}] Enriching ${org.name}`);
-
-                enrichedOrganizations.push(
-                    await enrichOrganizationWithGithub(org, caches, runtimeGithubCache)
-                );
-            }
-
-            canonicalOrganizations = canonicalizeOrganizations(enrichedOrganizations);
-
-            console.log(
-                `Canonical identity merge: ${enrichedOrganizations.length} -> ` +
-                `${canonicalOrganizations.length} organizations.`
-            );
-
-            const outputDir = path.resolve(__dirname, 'output');
-            const batchDir = path.join(outputDir, 'batches');
-
-            await fs.rm(outputDir, { recursive: true, force: true });
-            await fs.mkdir(batchDir, { recursive: true });
-
-            const batchSize = toPositiveInteger(process.env.DB_BATCH_SIZE, 100);
-            const batches = [];
-
-            for (let i = 0; i < canonicalOrganizations.length; i += batchSize) {
-                const batch = canonicalOrganizations.slice(i, i + batchSize);
-                const batchNumber = Math.floor(i / batchSize);
-                const fileName = `batch-${String(batchNumber).padStart(3, '0')}.json`;
-
-                await writeJsonFile(path.join(batchDir, fileName), batch);
-
-                batches.push({
-                    file: fileName,
-                    count: batch.length
-                });
-            }
-
-            // The complete enriched dataset is useful for the final output stage and
-            // gives us a reproducible snapshot independent of the DB jobs.
-            await writeJsonFile(
-                path.join(outputDir, 'enriched-organizations.json'),
-                canonicalOrganizations
-            );
-
-            await writeJsonFile(
-                path.join(outputDir, 'metadata.json'),
-                {
-                    syncRunId,
-                    gsocYears,
-                    batchSize,
-                    organizationCount: canonicalOrganizations.length,
-                    batches,
-                    sourceTotals: {
-                        categories: [...compiledOrgsData.totalCategories],
-                        topics: [...compiledOrgsData.totalTopics],
-                        technologies: [...compiledOrgsData.totalTechnologies]
-                    }
-                }
-            );
-
-            // Save the refreshed caches into the artifact. The DB jobs do not need
-            // GitHub access and do not modify these files.
-            await writeJsonFile(path.join(outputDir, 'github-id-and-orgnames.json'), caches.orgNames);
-            await writeJsonFile(path.join(outputDir, 'github-id-and-repos.json'), caches.repos);
-            await writeJsonFile(path.join(outputDir, 'github-id-and-contributors.json'), caches.contributors);
-            await writeJsonFile(path.join(outputDir, 'github-id-and-commits-count-hashmap.json'), caches.commits);
-
-            console.log('\n========================================');
-            console.log('Fetch + compile stage completed.');
-            console.log(`Organizations: ${canonicalOrganizations.length}`);
-            console.log(`Batches: ${batches.length}`);
-            console.log(`Batch size: ${batchSize}`);
-            console.log(`Sync run: ${syncRunId}`);
-            console.log('========================================');
-        } catch (error) {
-            console.error('\nFetch + compile stage failed:');
-            console.error(error);
-
-            if (syncRunId) {
-                try {
-                    await finishSyncRun(
-                        syncRunId,
-                        'FAILED',
-                        canonicalOrganizations.length,
-                        String(error?.stack || error?.message || error).slice(0, 10000)
-                    );
-                } catch (syncError) {
-                    console.error(`Unable to mark sync run as FAILED: ${syncError.message}`);
-                }
-            }
-
-            process.exitCode = 1;
-        } finally {
-            await pool.end();
-        }
-    }
-
-    async function persistBatchMode(batchFile) {
-        if (!batchFile) {
-            throw new Error('Usage: node index.js persist <batch-file>');
-        }
-
-        const organizations = await readJsonFile(path.resolve(batchFile));
-
-        if (!Array.isArray(organizations)) {
-            throw new Error(`Batch file must contain a JSON array: ${batchFile}`);
-        }
-
-        const persistence = createPersistenceService(pool);
-
-        console.log(`Persisting ${organizations.length} organizations from ${batchFile}`);
-
-        const result = await persistence.persistBatch(organizations);
-
-        const resultFile = process.env.BATCH_RESULT_FILE
-            ? path.resolve(process.env.BATCH_RESULT_FILE)
-            : path.resolve(
-                path.dirname(batchFile),
-                `${path.basename(batchFile, '.json')}-result.json`
-            );
-
-        await writeJsonFile(resultFile, {
-            batchFile: path.basename(batchFile),
-            requested: organizations.length,
-            processed: result.processed,
-            failures: result.failures
-        });
-
-        console.log(
-            `Batch complete: ${result.processed}/${organizations.length} processed; ` +
-            `${result.failures.length} failed.`
-        );
-
-        // Per-organization failures are intentionally recorded for the final stage.
-        // The process itself remains successful so other matrix batches can continue.
-        await pool.end();
-    }
-
-    async function finalizeMode() {
-        const metadataPath = process.env.PIPELINE_METADATA
-            ? path.resolve(process.env.PIPELINE_METADATA)
-            : path.resolve(__dirname, 'output/metadata.json');
-
-        const metadata = await readJsonFile(metadataPath);
-
-        if (!metadata?.syncRunId) {
-            throw new Error('metadata.json does not contain syncRunId.');
-        }
-
-        const persistence = createPersistenceService(pool);
-
-        const resultFiles = process.env.BATCH_RESULT_DIR
-            ? await fs.readdir(path.resolve(process.env.BATCH_RESULT_DIR))
-            : [];
-
-        const batchResults = [];
-
-        for (const fileName of resultFiles) {
-            if (!/\.json$/i.test(fileName) || !fileName.endsWith('-result.json')) continue;
-
-            const filePath = path.join(
-                path.resolve(process.env.BATCH_RESULT_DIR),
-                fileName
-            );
-
-            try {
-                batchResults.push(await readJsonFile(filePath));
-            } catch (error) {
-                console.warn(`Could not read batch result ${fileName}: ${error.message}`);
-            }
-        }
-
-        const processed = batchResults.reduce(
-            (sum, result) => sum + Number(result?.processed || 0),
-            0
-        );
-
-        const failures = batchResults.flatMap(result =>
-            Array.isArray(result?.failures) ? result.failures : []
-        );
-
-        const expected = Number(metadata.organizationCount || 0);
-        const successful = processed === expected && failures.length === 0;
-
-        // Never run authoritative global cleanup when one or more batches failed.
-        // Otherwise repositories/contributors belonging to a failed organization
-        // could be treated as orphans and deleted.
-        if (successful) {
-            await persistence.cleanupOrphans();
-        }
-
-        const enrichedOrganizationsPath = path.resolve(
-            path.dirname(metadataPath),
-            'enriched-organizations.json'
-        );
-
-        const enrichedOrganizations = await readJsonFile(enrichedOrganizationsPath, []);
-        const artifactDir = path.dirname(metadataPath);
-        const caches = {
-            orgNames: await readJsonFile(path.join(artifactDir, 'github-id-and-orgnames.json'), {}),
-            repos: await readJsonFile(path.join(artifactDir, 'github-id-and-repos.json'), {}),
-            contributors: await readJsonFile(path.join(artifactDir, 'github-id-and-contributors.json'), {}),
-            commits: await readJsonFile(path.join(artifactDir, 'github-id-and-commits-count-hashmap.json'), {})
-        };
-
-        const gsocYears = metadata.gsocYears || [];
-
-        if (successful) {
-            await writeLegacyOutputs(
-                enrichedOrganizations,
+                syncRunId,
                 gsocYears,
-                metadata.sourceTotals || {
-                    categories: [],
-                    topics: [],
-                    technologies: []
-                },
-                caches
-            );
-        }
-
-        await finishSyncRun(
-            metadata.syncRunId,
-            successful ? 'SUCCESS' : 'FAILED',
-            processed,
-            successful
-                ? null
-                : JSON.stringify({
-                    expected,
-                    processed,
-                    failures
-                }).slice(0, 10000)
+                batchSize,
+                organizationCount: canonicalOrganizations.length,
+                batches,
+                sourceTotals: {
+                    categories: [...compiledOrgsData.totalCategories],
+                    topics: [...compiledOrgsData.totalTopics],
+                    technologies: [...compiledOrgsData.totalTechnologies]
+                }
+            }
         );
 
-        if (!successful) {
-            throw new Error(
-                `Database synchronization incomplete: ${processed}/${expected} processed, ` +
-                `${failures.length} organization failures.`
-            );
-        }
+        // Save the refreshed caches into the artifact. The DB jobs do not need
+        // GitHub access and do not modify these files.
+        await writeJsonFile(path.join(outputDir, 'github-id-and-orgnames.json'), caches.orgNames);
+        await writeJsonFile(path.join(outputDir, 'github-id-and-repos.json'), caches.repos);
+        await writeJsonFile(path.join(outputDir, 'github-id-and-contributors.json'), caches.contributors);
+        await writeJsonFile(path.join(outputDir, 'github-id-and-commits-count-hashmap.json'), caches.commits);
 
         console.log('\n========================================');
-        console.log('Database finalization completed successfully.');
-        console.log(`Organizations processed: ${processed}/${expected}`);
-        console.log('Global orphan cleanup completed.');
+        console.log('Fetch + compile stage completed.');
+        console.log(`Organizations: ${canonicalOrganizations.length}`);
+        console.log(`Batches: ${batches.length}`);
+        console.log(`Batch size: ${batchSize}`);
+        console.log(`Sync run: ${syncRunId}`);
         console.log('========================================');
+    } catch (error) {
+        console.error('\nFetch + compile stage failed:');
+        console.error(error);
 
+        if (syncRunId) {
+            try {
+                await finishSyncRun(
+                    syncRunId,
+                    'FAILED',
+                    canonicalOrganizations.length,
+                    String(error?.stack || error?.message || error).slice(0, 10000)
+                );
+            } catch (syncError) {
+                console.error(`Unable to mark sync run as FAILED: ${syncError.message}`);
+            }
+        }
+
+        process.exitCode = 1;
+    } finally {
         await pool.end();
     }
+}
 
-    async function main() {
-        if (MODE === 'fetch') {
-            await compileDataFetch();
-            return;
+async function persistBatchMode(batchFile) {
+    if (!batchFile) {
+        throw new Error('Usage: node index.js persist <batch-file>');
+    }
+
+    const organizations = await readJsonFile(path.resolve(batchFile));
+
+    if (!Array.isArray(organizations)) {
+        throw new Error(`Batch file must contain a JSON array: ${batchFile}`);
+    }
+
+    const persistence = createPersistenceService(pool);
+
+    console.log(`Persisting ${organizations.length} organizations from ${batchFile}`);
+
+    const result = await persistence.persistBatch(organizations);
+
+    const resultFile = process.env.BATCH_RESULT_FILE
+        ? path.resolve(process.env.BATCH_RESULT_FILE)
+        : path.resolve(
+            path.dirname(batchFile),
+            `${path.basename(batchFile, '.json')}-result.json`
+        );
+
+    await writeJsonFile(resultFile, {
+        batchFile: path.basename(batchFile),
+        requested: organizations.length,
+        processed: result.processed,
+        failures: result.failures
+    });
+
+    console.log(
+        `Batch complete: ${result.processed}/${organizations.length} processed; ` +
+        `${result.failures.length} failed.`
+    );
+
+    // Per-organization failures are intentionally recorded for the final stage.
+    // The process itself remains successful so other matrix batches can continue.
+    await pool.end();
+}
+
+async function finalizeMode() {
+    const metadataPath = process.env.PIPELINE_METADATA
+        ? path.resolve(process.env.PIPELINE_METADATA)
+        : path.resolve(__dirname, 'output/metadata.json');
+
+    const metadata = await readJsonFile(metadataPath);
+
+    if (!metadata?.syncRunId) {
+        throw new Error('metadata.json does not contain syncRunId.');
+    }
+
+    const persistence = createPersistenceService(pool);
+
+    const resultFiles = process.env.BATCH_RESULT_DIR
+        ? await fs.readdir(path.resolve(process.env.BATCH_RESULT_DIR))
+        : [];
+
+    const batchResults = [];
+
+    for (const fileName of resultFiles) {
+        if (!/\.json$/i.test(fileName) || !fileName.endsWith('-result.json')) continue;
+
+        const filePath = path.join(
+            path.resolve(process.env.BATCH_RESULT_DIR),
+            fileName
+        );
+
+        try {
+            batchResults.push(await readJsonFile(filePath));
+        } catch (error) {
+            console.warn(`Could not read batch result ${fileName}: ${error.message}`);
         }
+    }
 
-        if (MODE === 'persist') {
-            await persistBatchMode(PERSIST_BATCH_FILE);
-            return;
-        }
+    const processed = batchResults.reduce(
+        (sum, result) => sum + Number(result?.processed || 0),
+        0
+    );
 
-        if (MODE === 'finalize') {
-            await finalizeMode();
-            return;
-        }
+    const failures = batchResults.flatMap(result =>
+        Array.isArray(result?.failures) ? result.failures : []
+    );
 
-        throw new Error(
-            'Usage: node index.js fetch | node index.js persist <batch-file> | node index.js finalize'
+    const expected = Number(metadata.organizationCount || 0);
+    const successful = processed === expected && failures.length === 0;
+
+    // Never run authoritative global cleanup when one or more batches failed.
+    // Otherwise repositories/contributors belonging to a failed organization
+    // could be treated as orphans and deleted.
+    if (successful) {
+        await persistence.cleanupOrphans();
+    }
+
+    const enrichedOrganizationsPath = path.resolve(
+        path.dirname(metadataPath),
+        'enriched-organizations.json'
+    );
+
+    const enrichedOrganizations = await readJsonFile(enrichedOrganizationsPath, []);
+    const artifactDir = path.dirname(metadataPath);
+    const caches = {
+        orgNames: await readJsonFile(path.join(artifactDir, 'github-id-and-orgnames.json'), {}),
+        repos: await readJsonFile(path.join(artifactDir, 'github-id-and-repos.json'), {}),
+        contributors: await readJsonFile(path.join(artifactDir, 'github-id-and-contributors.json'), {}),
+        commits: await readJsonFile(path.join(artifactDir, 'github-id-and-commits-count-hashmap.json'), {})
+    };
+
+    const gsocYears = metadata.gsocYears || [];
+
+    if (successful) {
+        await writeLegacyOutputs(
+            enrichedOrganizations,
+            gsocYears,
+            metadata.sourceTotals || {
+                categories: [],
+                topics: [],
+                technologies: []
+            },
+            caches
         );
     }
 
-    await main();
+    await finishSyncRun(
+        metadata.syncRunId,
+        successful ? 'SUCCESS' : 'FAILED',
+        processed,
+        successful
+            ? null
+            : JSON.stringify({
+                expected,
+                processed,
+                failures
+            }).slice(0, 10000)
+    );
+
+    if (!successful) {
+        throw new Error(
+            `Database synchronization incomplete: ${processed}/${expected} processed, ` +
+            `${failures.length} organization failures.`
+        );
+    }
+
+    console.log('\n========================================');
+    console.log('Database finalization completed successfully.');
+    console.log(`Organizations processed: ${processed}/${expected}`);
+    console.log('Global orphan cleanup completed.');
+    console.log('========================================');
+
+    await pool.end();
+}
+
+async function main() {
+    if (MODE === 'fetch') {
+        await compileDataFetch();
+        return;
+    }
+
+    if (MODE === 'persist') {
+        await persistBatchMode(PERSIST_BATCH_FILE);
+        return;
+    }
+
+    if (MODE === 'finalize') {
+        await finalizeMode();
+        return;
+    }
+
+    throw new Error(
+        'Usage: node index.js fetch | node index.js persist <batch-file> | node index.js finalize'
+    );
+}
+
+await main();
