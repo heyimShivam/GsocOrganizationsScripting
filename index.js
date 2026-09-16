@@ -16,7 +16,7 @@ const __dirname = path.dirname(__filename);
 // Configuration
 // -----------------------------------------------------------------------------
 
-const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || process.env.ITHUB_TOKEN || '').trim();
+const GITHUB_TOKEN = (process.env.ITHUB_TOKEN || '').trim();
 const MODE = process.argv[2] || 'fetch';
 const PERSIST_BATCH_FILE = process.argv[3] || null;
 
@@ -28,8 +28,8 @@ const GSOC_DIR = path.resolve(__dirname, process.env.GSOC_DIR || './GSoC');
 const USE_OLD_RECORDS = parseBoolean(process.env.USE_OLD_RECORDS, false);
 const WRITE_LEGACY_JSON = parseBoolean(process.env.WRITE_LEGACY_JSON, true);
 const ACTIVITY_REPO_LIMIT = toPositiveInteger(process.env.ACTIVITY_REPO_LIMIT, 3);
-const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.GITHUB_MIN_TIME_MS || process.env.ITHUBMIN_TIME_MS, 2000);
-const GITHUB_MAX_CONCURRENT = toPositiveInteger(process.env.GITHUB_MAX_CONCURRENT || process.env.ITHUB_MAX_CONCURRENT, 1);
+const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.ITHUB_MIN_TIME_MS, 2000);
+const GITHUB_MAX_CONCURRENT = toPositiveInteger(process.env.ITHUB_MAX_CONCURRENT, 1);
 const MAX_GITHUB_RETRIES = toNonNegativeInteger(process.env.MAX_GITHUB_RETRIES, 3);
 
 // Set to 0 to fetch every page.

@@ -34,15 +34,15 @@ jobs:
 
       - name: Fetch and enrich organizations
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ITHUB_TOKEN: ${{ secrets.ITHUB_TOKEN }}
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
 
           USE_OLD_RECORDS: ${{ secrets.USE_OLD_RECORDS }}
           WRITE_LEGACY_JSON: ${{ secrets.WRITE_LEGACY_JSON }}
 
           ACTIVITY_REPO_LIMIT: 3
-          GITHUB_MIN_TIME_MS: 1000
-          GITHUB_MAX_CONCURRENT: 1
+          ITHUB_MIN_TIME_MS: 1000
+          ITHUB_MAX_CONCURRENT: 1
           MAX_GITHUB_RETRIES: 2
 
           # Database batch size
