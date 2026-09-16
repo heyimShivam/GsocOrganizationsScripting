@@ -28,7 +28,7 @@ const GSOC_DIR = path.resolve(__dirname, process.env.GSOC_DIR || './GSoC');
 const USE_OLD_RECORDS = parseBoolean(process.env.USE_OLD_RECORDS, false);
 const WRITE_LEGACY_JSON = parseBoolean(process.env.WRITE_LEGACY_JSON, true);
 const ACTIVITY_REPO_LIMIT = toPositiveInteger(process.env.ACTIVITY_REPO_LIMIT, 3);
-const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.ITHUB_MIN_TIME_MS, 2000);
+const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.ITHUBMIN_TIME_MS, 2000);
 const GITHUB_MAX_CONCURRENT = toPositiveInteger(process.env.ITHUB_MAX_CONCURRENT, 1);
 const MAX_GITHUB_RETRIES = toNonNegativeInteger(process.env.MAX_GITHUB_RETRIES, 3);
 
@@ -662,7 +662,11 @@ async function enrichOrganizationWithGithub(org, caches, runtimeGithubCache) {
 function databaseIdentityKey(org) {
     const name = String(org.name ?? '').trim().toLowerCase();
     const githubID = normalizeGithubId(org.githubID);
-    return githubID ? `${name}::${githubID.toLowerCase()}` : `${name}::NO_GITHUB`;
+
+    // GitHub ID is the stable identity. If the organization changes its
+    // displayed GSoC name, it must still resolve to the same organization.
+    // When no GitHub ID exists, fall back to the normalized organization name.
+    return githubID ? `github::${githubID.toLowerCase()}` : `name::${name}`;
 }
 
 function projectIdentity(project) {
@@ -830,6 +834,38 @@ async function writeLegacyOutputs(organizations, gsocYears, sourceTotals, caches
     );
 
     console.log('Legacy JSON files saved.');
+}
+
+// -----------------------------------------------------------------------------
+// Sync run tracking
+// -----------------------------------------------------------------------------
+
+async function createSyncRun() {
+    const result = await pool.query(
+        `
+        INSERT INTO data_sync_runs (source, status)
+        VALUES ('GSOC_GITHUB', 'RUNNING')
+        RETURNING id;
+        `
+    );
+
+    return result.rows[0].id;
+}
+
+async function finishSyncRun(syncRunId, status, recordsProcessed, errorMessage = null) {
+    if (!syncRunId) return;
+
+    await pool.query(
+        `
+        UPDATE data_sync_runs
+        SET status = $2,
+            records_processed = $3,
+            error_message = $4,
+            finished_at = CURRENT_TIMESTAMP
+        WHERE id = $1;
+        `,
+        [syncRunId, status, recordsProcessed, errorMessage]
+    );
 }
 
 // -----------------------------------------------------------------------------

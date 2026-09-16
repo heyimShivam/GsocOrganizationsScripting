@@ -41,7 +41,7 @@ jobs:
           WRITE_LEGACY_JSON: ${{ secrets.WRITE_LEGACY_JSON }}
 
           ACTIVITY_REPO_LIMIT: 3
-          ITHUB_MIN_TIME_MS: 1000
+          ITHUBMIN_TIME_MS: 1000
           ITHUB_MAX_CONCURRENT: 1
           MAX_GITHUB_RETRIES: 2
 
