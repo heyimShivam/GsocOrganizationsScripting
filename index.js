@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { config } from 'dotenv';
 import Bottleneck from 'bottleneck';
 import pg from 'pg';
+import { createPersistenceService } from './db-persistence.js';
 
 config();
 
@@ -15,17 +16,20 @@ const __dirname = path.dirname(__filename);
 // Configuration
 // -----------------------------------------------------------------------------
 
-const GITHUB_TOKEN = process.env.ITHUB_TOKEN?.trim();
-if (!GITHUB_TOKEN) {
-    throw new Error('GITHUB_TOKEN is required. Put it in .env or your CI secrets.');
+const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || process.env.ITHUB_TOKEN || '').trim();
+const MODE = process.argv[2] || 'fetch';
+const PERSIST_BATCH_FILE = process.argv[3] || null;
+
+if (MODE === 'fetch' && !GITHUB_TOKEN) {
+    throw new Error('GITHUB_TOKEN is required for fetch mode. Put it in .env or your CI secrets.');
 }
 
 const GSOC_DIR = path.resolve(__dirname, process.env.GSOC_DIR || './GSoC');
 const USE_OLD_RECORDS = parseBoolean(process.env.USE_OLD_RECORDS, false);
 const WRITE_LEGACY_JSON = parseBoolean(process.env.WRITE_LEGACY_JSON, true);
 const ACTIVITY_REPO_LIMIT = toPositiveInteger(process.env.ACTIVITY_REPO_LIMIT, 3);
-const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.ITHUBMIN_TIME_MS, 2000);
-const GITHUB_MAX_CONCURRENT = toPositiveInteger(process.env.ITHUB_MAX_CONCURRENT, 1);
+const GITHUB_MIN_TIME_MS = toPositiveInteger(process.env.GITHUB_MIN_TIME_MS || process.env.ITHUBMIN_TIME_MS, 2000);
+const GITHUB_MAX_CONCURRENT = toPositiveInteger(process.env.GITHUB_MAX_CONCURRENT || process.env.ITHUB_MAX_CONCURRENT, 1);
 const MAX_GITHUB_RETRIES = toNonNegativeInteger(process.env.MAX_GITHUB_RETRIES, 3);
 
 // Set to 0 to fetch every page.
@@ -46,7 +50,7 @@ const CACHE_FILES = {
     commits: path.join(__dirname, 'github-id-and-commits-count-hashmap.json')
 };
 
-console.log('GITHUB_TOKEN:', `Bearer ${GITHUB_TOKEN}`);
+console.log('GitHub token configured:', Boolean(GITHUB_TOKEN));
 const githubHeaders = {
     'Authorization': `Bearer ${GITHUB_TOKEN}`,
     'Accept': 'application/vnd.github+json',
@@ -741,622 +745,10 @@ function mergeCanonicalOrganization(base, incoming) {
 function canonicalizeOrganizations(organizations) {
     const map = new Map();
 
-    for (const org of organizations) {
-        const key = databaseIdentityKey(org);
-
-        if (!map.has(key)) {
-            map.set(key, structuredClone(org));
-        } else {
-            mergeCanonicalOrganization(map.get(key), org);
-        }
-    }
-
-    return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
-}
-
-// -----------------------------------------------------------------------------
+    for (const org of organiz// -----------------------------------------------------------------------------
 // PostgreSQL persistence
+// Bulk/resumable persistence lives in db-persistence.js.
 // -----------------------------------------------------------------------------
-
-async function createSyncRun() {
-    const result = await pool.query(
-        `
-        INSERT INTO data_sync_runs (source, status)
-        VALUES ('GSOC_GITHUB', 'RUNNING')
-        RETURNING id;
-        `
-    );
-
-    return result.rows[0].id;
-}
-
-async function finishSyncRun(syncRunId, status, recordsProcessed, errorMessage = null) {
-    await pool.query(
-        `
-        UPDATE data_sync_runs
-        SET status = $2,
-            records_processed = $3,
-            error_message = $4,
-            finished_at = CURRENT_TIMESTAMP
-        WHERE id = $1;
-        `,
-        [syncRunId, status, recordsProcessed, errorMessage]
-    );
-}
-
-async function findExistingOrganization(client, orgName, githubId) {
-    if (githubId) {
-        const exact = await client.query(
-            `
-            SELECT id, github_id
-            FROM organizations
-            WHERE LOWER(name) = LOWER($1)
-              AND LOWER(github_id) = LOWER($2)
-            LIMIT 1;
-            `,
-            [orgName, githubId]
-        );
-
-        if (exact.rows[0]) return exact.rows[0];
-
-        // If an earlier run only knew the name (github_id NULL), upgrade that row
-        // instead of creating a duplicate.
-        const noGithub = await client.query(
-            `
-            SELECT id, github_id
-            FROM organizations
-            WHERE LOWER(name) = LOWER($1)
-              AND github_id IS NULL
-            LIMIT 1;
-            `,
-            [orgName]
-        );
-
-        if (noGithub.rows[0]) return noGithub.rows[0];
-
-        return null;
-    }
-
-    // githubID == NA: name is the identity. If a previous run already resolved a
-    // GitHub ID for that exact name, reuse the row and do NOT erase that ID.
-    const byName = await client.query(
-        `
-        SELECT id, github_id
-        FROM organizations
-        WHERE LOWER(name) = LOWER($1)
-        ORDER BY github_id NULLS LAST
-        LIMIT 2;
-        `,
-        [orgName]
-    );
-
-    if (byName.rows.length > 1) {
-        throw new Error(
-            `Ambiguous organization identity for ${orgName}: githubID is NA but multiple rows share this name.`
-        );
-    }
-
-    return byName.rows[0] || null;
-}
-
-async function upsertOrganization(client, org) {
-    const githubId = normalizeGithubId(org.githubID);
-    const existing = await findExistingOrganization(client, org.name, githubId);
-
-    if (existing) {
-        const result = await client.query(
-            `
-            UPDATE organizations
-            SET name = $2,
-                image_url = $3,
-                image_background_color = $4,
-                description = $5,
-                url = $6,
-                github_id = COALESCE($7, github_id),
-                active_org = $8,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $1
-            RETURNING id;
-            `,
-            [
-                existing.id,
-                org.name,
-                org.image_url || null,
-                org.image_background_color || null,
-                org.description || null,
-                org.url || null,
-                githubId,
-                Boolean(org.activeOrg)
-            ]
-        );
-
-        return result.rows[0].id;
-    }
-
-    const result = await client.query(
-        `
-        INSERT INTO organizations (
-            name,
-            image_url,
-            image_background_color,
-            description,
-            url,
-            github_id,
-            active_org
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id;
-        `,
-        [
-            org.name,
-            org.image_url || null,
-            org.image_background_color || null,
-            org.description || null,
-            org.url || null,
-            githubId,
-            Boolean(org.activeOrg)
-        ]
-    );
-
-    return result.rows[0].id;
-}
-
-async function replaceOrganizationContacts(client, organizationId, org) {
-    await client.query(
-        `
-        INSERT INTO organization_contacts (
-            organization_id,
-            irc_channel,
-            contact_email,
-            mailing_list,
-            twitter_url,
-            blog_url,
-            facebook_url
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (organization_id)
-        DO UPDATE SET
-            irc_channel = EXCLUDED.irc_channel,
-            contact_email = EXCLUDED.contact_email,
-            mailing_list = EXCLUDED.mailing_list,
-            twitter_url = EXCLUDED.twitter_url,
-            blog_url = EXCLUDED.blog_url,
-            facebook_url = EXCLUDED.facebook_url;
-        `,
-        [
-            organizationId,
-            org.irc_channel || null,
-            org.contact_email || null,
-            org.mailing_list || null,
-            org.twitter_url || null,
-            org.blog_url || null,
-            org.facebook_url || null
-        ]
-    );
-}
-
-async function replaceOrganizationYearsAndProjects(client, organizationId, org) {
-    // gsoc_projects references organization_years with ON DELETE CASCADE.
-    await client.query(
-        'DELETE FROM organization_years WHERE organization_id = $1;',
-        [organizationId]
-    );
-
-    const years = [...new Set((org.year || []).map(Number).filter(Number.isInteger))]
-        .sort((a, b) => a - b);
-
-    for (const year of years) {
-        await client.query(
-            `
-            INSERT INTO organization_years (organization_id, year)
-            VALUES ($1, $2);
-            `,
-            [organizationId, year]
-        );
-
-        const projects = Array.isArray(org.projects?.[year])
-            ? org.projects[year]
-            : Array.isArray(org.projects?.[String(year)])
-                ? org.projects[String(year)]
-                : [];
-
-        for (const project of projects) {
-            if (!project?.title) continue;
-
-            await client.query(
-                `
-                INSERT INTO gsoc_projects (
-                    organization_id,
-                    year,
-                    title,
-                    short_description,
-                    description,
-                    student_name,
-                    code_url,
-                    proposal_id,
-                    project_url
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
-                `,
-                [
-                    organizationId,
-                    year,
-                    project.title,
-                    project.short_description || null,
-                    project.description || null,
-                    project.student_name || null,
-                    project.code_url || null,
-                    project.proposal_id || null,
-                    project.project_url || null
-                ]
-            );
-        }
-    }
-}
-
-async function upsertLookupValue(client, tableName, value) {
-    const allowedTables = new Set(['categories', 'topics', 'technologies']);
-    if (!allowedTables.has(tableName)) throw new Error(`Unsupported lookup table: ${tableName}`);
-
-    const result = await client.query(
-        `
-        INSERT INTO ${tableName} (name)
-        VALUES ($1)
-        ON CONFLICT ((LOWER(name)))
-        DO UPDATE SET name = EXCLUDED.name
-        RETURNING id;
-        `,
-        [value]
-    );
-
-    return result.rows[0].id;
-}
-
-async function replaceManyToManyLookup(
-    client,
-    organizationId,
-    values,
-    lookupTable,
-    junctionTable,
-    junctionIdColumn
-) {
-    await client.query(
-        `DELETE FROM ${junctionTable} WHERE organization_id = $1;`,
-        [organizationId]
-    );
-
-    for (const value of uniqueCaseInsensitive(values)) {
-        const lookupId = await upsertLookupValue(client, lookupTable, value);
-
-        await client.query(
-            `
-            INSERT INTO ${junctionTable} (organization_id, ${junctionIdColumn})
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING;
-            `,
-            [organizationId, lookupId]
-        );
-    }
-}
-
-async function replaceTaxonomies(client, organizationId, org) {
-    await replaceManyToManyLookup(
-        client,
-        organizationId,
-        org.category,
-        'categories',
-        'organization_categories',
-        'category_id'
-    );
-
-    await replaceManyToManyLookup(
-        client,
-        organizationId,
-        org.topics,
-        'topics',
-        'organization_topics',
-        'topic_id'
-    );
-
-    await replaceManyToManyLookup(
-        client,
-        organizationId,
-        org.technologies,
-        'technologies',
-        'organization_technologies',
-        'technology_id'
-    );
-}
-
-async function replaceRepositories(client, organizationId, repositories) {
-    await client.query(
-        'DELETE FROM organization_repositories WHERE organization_id = $1;',
-        [organizationId]
-    );
-
-    for (const repo of repositories || []) {
-        if (!repo?.id || !repo?.name) continue;
-
-        const license = repo.license || {};
-
-        const result = await client.query(
-            `
-            INSERT INTO repositories (
-                github_repo_id,
-                github_node_id,
-                name,
-                full_name,
-                html_url,
-                description,
-                language,
-                stars,
-                forks,
-                open_issues,
-                license_key,
-                license_name,
-                license_spdx_id,
-                license_url,
-                last_synced_at
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, $6, $7,
-                $8, $9, $10, $11, $12, $13, $14,
-                CURRENT_TIMESTAMP
-            )
-            ON CONFLICT (github_repo_id)
-            DO UPDATE SET
-                github_node_id = EXCLUDED.github_node_id,
-                name = EXCLUDED.name,
-                full_name = EXCLUDED.full_name,
-                html_url = EXCLUDED.html_url,
-                description = EXCLUDED.description,
-                language = EXCLUDED.language,
-                stars = EXCLUDED.stars,
-                forks = EXCLUDED.forks,
-                open_issues = EXCLUDED.open_issues,
-                license_key = EXCLUDED.license_key,
-                license_name = EXCLUDED.license_name,
-                license_spdx_id = EXCLUDED.license_spdx_id,
-                license_url = EXCLUDED.license_url,
-                last_synced_at = CURRENT_TIMESTAMP
-            RETURNING id;
-            `,
-            [
-                repo.id,
-                repo.node_id || null,
-                repo.name,
-                repo.full_name || null,
-                repo.html_url || null,
-                repo.description || null,
-                repo.language || null,
-                Number(repo.stargazers_count || 0),
-                Number(repo.forks_count || 0),
-                Number(repo.open_issues_count || 0),
-                license.key || null,
-                license.name || null,
-                license.spdx_id || null,
-                license.url || null
-            ]
-        );
-
-        const repositoryId = result.rows[0].id;
-
-        await client.query(
-            `
-            INSERT INTO organization_repositories (organization_id, repository_id)
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING;
-            `,
-            [organizationId, repositoryId]
-        );
-
-        await client.query(
-            'DELETE FROM repository_topics WHERE repository_id = $1;',
-            [repositoryId]
-        );
-
-        for (const topic of uniqueCaseInsensitive(repo.topics)) {
-            await client.query(
-                `
-                INSERT INTO repository_topics (repository_id, topic)
-                VALUES ($1, $2)
-                ON CONFLICT DO NOTHING;
-                `,
-                [repositoryId, topic]
-            );
-        }
-    }
-}
-
-async function replaceContributors(client, organizationId, contributors) {
-    await client.query(
-        'DELETE FROM organization_contributors WHERE organization_id = $1;',
-        [organizationId]
-    );
-
-    for (const contributor of contributors || []) {
-        if (!contributor?.id || !contributor?.login) continue;
-
-        const result = await client.query(
-            `
-            INSERT INTO contributors (
-                github_user_id,
-                github_node_id,
-                login,
-                avatar_url,
-                html_url
-            )
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (github_user_id)
-            DO UPDATE SET
-                github_node_id = EXCLUDED.github_node_id,
-                login = EXCLUDED.login,
-                avatar_url = EXCLUDED.avatar_url,
-                html_url = EXCLUDED.html_url
-            RETURNING id;
-            `,
-            [
-                contributor.id,
-                contributor.node_id || null,
-                contributor.login,
-                contributor.avatar_url || null,
-                contributor.html_url || null
-            ]
-        );
-
-        await client.query(
-            `
-            INSERT INTO organization_contributors (
-                organization_id,
-                contributor_id,
-                contributions
-            )
-            VALUES ($1, $2, $3)
-            ON CONFLICT (organization_id, contributor_id)
-            DO UPDATE SET contributions = EXCLUDED.contributions;
-            `,
-            [
-                organizationId,
-                result.rows[0].id,
-                Number(contributor.contributions || 0)
-            ]
-        );
-    }
-}
-
-async function insertGithubStats(client, organizationId, totalCommits) {
-    await client.query(
-        `
-        INSERT INTO organization_github_stats (
-            organization_id,
-            commit_count
-        )
-        VALUES ($1, $2);
-        `,
-        [organizationId, Number(totalCommits || 0)]
-    );
-}
-
-async function persistOrganization(client, org) {
-    console.log(`[${org.name}] Starting organization upsert`);
-    const organizationId = await upsertOrganization(client, org);
-    console.log(`[${org.name}] Organization upserted: ${organizationId}`);
-
-    console.log(`[${org.name}] Adding contacts`);
-    await replaceOrganizationContacts(client, organizationId, org);
-
-    console.log(`[${org.name}] Adding years and projects`);
-    await replaceOrganizationYearsAndProjects(client, organizationId, org);
-
-    console.log(`[${org.name}] Adding taxonomies`);
-    await replaceTaxonomies(client, organizationId, org);
-
-    console.log(`[${org.name}] Adding repositories`);
-    await replaceRepositories(
-        client,
-        organizationId,
-        org.repositories || []
-    );
-
-    console.log(`[${org.name}] Adding contributors`);
-    await replaceContributors(
-        client,
-        organizationId,
-        org.contributorsDetails || []
-    );
-
-    console.log(`[${org.name}] Adding GitHub stats`);
-    await insertGithubStats(
-        client,
-        organizationId,
-        org.totalCommits || 0
-    );
-
-    console.log(`[${org.name}] Organization persistence completed`);
-
-    return organizationId;
-}
-
-// -----------------------------------------------------------------------------
-// CHANGED: each organization is now persisted in its OWN transaction instead
-// of all 530 orgs sharing a single BEGIN/COMMIT. This keeps individual
-// transactions short (lighter on Neon's free-tier compute/connection limits)
-// and means a failure on one org no longer rolls back every org that already
-// succeeded. The one connection (`client`) is still reused for the whole run
-// to avoid 530 separate connect/disconnect round trips.
-// -----------------------------------------------------------------------------
-async function persistAllOrganizations(organizations) {
-    const client = await pool.connect();
-    let processed = 0;
-    const failures = [];
-
-    try {
-        for (const org of organizations) {
-            try {
-                await client.query('BEGIN');
-
-                console.log(
-                    `\n[DB START ${processed + 1}/${organizations.length}] Adding organization: ${org.name}`
-                );
-
-                console.log('GitHub ID:', org.githubID);
-                console.log('Repositories:', org.repositories?.length || 0);
-                console.log('Contributors:', org.contributorsDetails?.length || 0);
-                console.log('Years:', org.year?.length || 0);
-
-                await persistOrganization(client, org);
-
-                await client.query('COMMIT');
-                processed++;
-
-                console.log(
-                    `[DB DONE ${processed}/${organizations.length}] Successfully added: ${org.name}`
-                );
-            } catch (error) {
-                await client.query('ROLLBACK');
-                console.error(`[DB FAILED] ${org.name}: ${error.message}`);
-                failures.push({ name: org.name, error: error.message });
-                // Continue with the next org instead of aborting the whole run.
-            }
-        }
-
-        // Remove global GitHub records no longer linked to any organization.
-        // This keeps repeat refreshes from leaving stale orphan rows.
-        // Runs in its own small transaction, once, after all orgs are done.
-        await client.query('BEGIN');
-
-        await client.query(`
-            DELETE FROM repositories r
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM organization_repositories orr
-                WHERE orr.repository_id = r.id
-            );
-        `);
-
-        await client.query(`
-            DELETE FROM contributors c
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM organization_contributors oc
-                WHERE oc.contributor_id = c.id
-            );
-        `);
-
-        await client.query('COMMIT');
-    } catch (error) {
-        try {
-            await client.query('ROLLBACK');
-        } catch {
-            // ignore rollback errors here; original error is what matters
-        }
-        throw error;
-    } finally {
-        client.release();
-    }
-
-    return { processed, failures };
-}
 
 // -----------------------------------------------------------------------------
 // Backward-compatible JSON output
@@ -1440,7 +832,7 @@ async function loadCaches() {
     };
 }
 
-async function compileData() {
+async function compileDataFetch() {
     let syncRunId = null;
     let canonicalOrganizations = [];
 
@@ -1465,9 +857,11 @@ async function compileData() {
         const runtimeGithubCache = new Map();
         const enrichedOrganizations = [];
 
+        // IMPORTANT: GitHub enrichment remains exactly sequential.
         for (let i = 0; i < organizations.length; i++) {
             const org = organizations[i];
             console.log(`\n[${i + 1}/${organizations.length}] Enriching ${org.name}`);
+
             enrichedOrganizations.push(
                 await enrichOrganizationWithGithub(org, caches, runtimeGithubCache)
             );
@@ -1476,49 +870,71 @@ async function compileData() {
         canonicalOrganizations = canonicalizeOrganizations(enrichedOrganizations);
 
         console.log(
-            `Canonical identity merge: ${enrichedOrganizations.length} -> ${canonicalOrganizations.length} organizations.`
+            `Canonical identity merge: ${enrichedOrganizations.length} -> ` +
+            `${canonicalOrganizations.length} organizations.`
         );
 
-        // CHANGED: persistAllOrganizations now commits per-organization and
-        // returns how many succeeded plus any per-org failures, instead of
-        // an all-or-nothing single transaction.
-        const { processed, failures } = await persistAllOrganizations(canonicalOrganizations);
+        const outputDir = path.resolve(__dirname, 'output');
+        const batchDir = path.join(outputDir, 'batches');
 
-        if (failures.length > 0) {
-            console.warn(`\n${failures.length} organization(s) failed to persist:`);
-            for (const failure of failures) {
-                console.warn(`  - ${failure.name}: ${failure.error}`);
-            }
+        await fs.rm(outputDir, { recursive: true, force: true });
+        await fs.mkdir(batchDir, { recursive: true });
+
+        const batchSize = toPositiveInteger(process.env.DB_BATCH_SIZE, 100);
+        const batches = [];
+
+        for (let i = 0; i < canonicalOrganizations.length; i += batchSize) {
+            const batch = canonicalOrganizations.slice(i, i + batchSize);
+            const batchNumber = Math.floor(i / batchSize);
+            const fileName = `batch-${String(batchNumber).padStart(3, '0')}.json`;
+
+            await writeJsonFile(path.join(batchDir, fileName), batch);
+
+            batches.push({
+                file: fileName,
+                count: batch.length
+            });
         }
 
-        await writeLegacyOutputs(
-            canonicalOrganizations,
-            gsocYears,
-            {
-                categories: [...compiledOrgsData.totalCategories],
-                topics: [...compiledOrgsData.totalTopics],
-                technologies: [...compiledOrgsData.totalTechnologies]
-            },
-            caches
+        // The complete enriched dataset is useful for the final output stage and
+        // gives us a reproducible snapshot independent of the DB jobs.
+        await writeJsonFile(
+            path.join(outputDir, 'enriched-organizations.json'),
+            canonicalOrganizations
         );
 
-        await finishSyncRun(
-            syncRunId,
-            'SUCCESS',
-            processed,
-            failures.length > 0 ? JSON.stringify(failures).slice(0, 10000) : null
+        await writeJsonFile(
+            path.join(outputDir, 'metadata.json'),
+            {
+                syncRunId,
+                gsocYears,
+                batchSize,
+                organizationCount: canonicalOrganizations.length,
+                batches,
+                sourceTotals: {
+                    categories: [...compiledOrgsData.totalCategories],
+                    topics: [...compiledOrgsData.totalTopics],
+                    technologies: [...compiledOrgsData.totalTechnologies]
+                }
+            }
         );
+
+        // Save the refreshed caches into the artifact. The DB jobs do not need
+        // GitHub access and do not modify these files.
+        await writeJsonFile(path.join(outputDir, 'github-id-and-orgnames.json'), caches.orgNames);
+        await writeJsonFile(path.join(outputDir, 'github-id-and-repos.json'), caches.repos);
+        await writeJsonFile(path.join(outputDir, 'github-id-and-contributors.json'), caches.contributors);
+        await writeJsonFile(path.join(outputDir, 'github-id-and-commits-count-hashmap.json'), caches.commits);
 
         console.log('\n========================================');
-        console.log('GSoC Hub refresh completed successfully.');
-        console.log(`Years: ${gsocYears[0]}-${gsocYears[gsocYears.length - 1]}`);
-        console.log(`Organizations processed: ${processed}/${canonicalOrganizations.length}`);
-        if (failures.length > 0) {
-            console.log(`Organizations failed: ${failures.length}`);
-        }
+        console.log('Fetch + compile stage completed.');
+        console.log(`Organizations: ${canonicalOrganizations.length}`);
+        console.log(`Batches: ${batches.length}`);
+        console.log(`Batch size: ${batchSize}`);
+        console.log(`Sync run: ${syncRunId}`);
         console.log('========================================');
     } catch (error) {
-        console.error('\nGSoC Hub refresh failed:');
+        console.error('\nFetch + compile stage failed:');
         console.error(error);
 
         if (syncRunId) {
@@ -1540,4 +956,177 @@ async function compileData() {
     }
 }
 
-await compileData();
+async function persistBatchMode(batchFile) {
+    if (!batchFile) {
+        throw new Error('Usage: node index.js persist <batch-file>');
+    }
+
+    const organizations = await readJsonFile(path.resolve(batchFile));
+
+    if (!Array.isArray(organizations)) {
+        throw new Error(`Batch file must contain a JSON array: ${batchFile}`);
+    }
+
+    const persistence = createPersistenceService(pool);
+
+    console.log(`Persisting ${organizations.length} organizations from ${batchFile}`);
+
+    const result = await persistence.persistBatch(organizations);
+
+    const resultFile = process.env.BATCH_RESULT_FILE
+        ? path.resolve(process.env.BATCH_RESULT_FILE)
+        : path.resolve(
+            path.dirname(batchFile),
+            `${path.basename(batchFile, '.json')}-result.json`
+        );
+
+    await writeJsonFile(resultFile, {
+        batchFile: path.basename(batchFile),
+        requested: organizations.length,
+        processed: result.processed,
+        failures: result.failures
+    });
+
+    console.log(
+        `Batch complete: ${result.processed}/${organizations.length} processed; ` +
+        `${result.failures.length} failed.`
+    );
+
+    // Per-organization failures are intentionally recorded for the final stage.
+    // The process itself remains successful so other matrix batches can continue.
+    await pool.end();
+}
+
+async function finalizeMode() {
+    const metadataPath = process.env.PIPELINE_METADATA
+        ? path.resolve(process.env.PIPELINE_METADATA)
+        : path.resolve(__dirname, 'output/metadata.json');
+
+    const metadata = await readJsonFile(metadataPath);
+
+    if (!metadata?.syncRunId) {
+        throw new Error('metadata.json does not contain syncRunId.');
+    }
+
+    const persistence = createPersistenceService(pool);
+
+    const resultFiles = process.env.BATCH_RESULT_DIR
+        ? await fs.readdir(path.resolve(process.env.BATCH_RESULT_DIR))
+        : [];
+
+    const batchResults = [];
+
+    for (const fileName of resultFiles) {
+        if (!/\.json$/i.test(fileName) || !fileName.endsWith('-result.json')) continue;
+
+        const filePath = path.join(
+            path.resolve(process.env.BATCH_RESULT_DIR),
+            fileName
+        );
+
+        try {
+            batchResults.push(await readJsonFile(filePath));
+        } catch (error) {
+            console.warn(`Could not read batch result ${fileName}: ${error.message}`);
+        }
+    }
+
+    const processed = batchResults.reduce(
+        (sum, result) => sum + Number(result?.processed || 0),
+        0
+    );
+
+    const failures = batchResults.flatMap(result =>
+        Array.isArray(result?.failures) ? result.failures : []
+    );
+
+    const expected = Number(metadata.organizationCount || 0);
+    const successful = processed === expected && failures.length === 0;
+
+    // Never run authoritative global cleanup when one or more batches failed.
+    // Otherwise repositories/contributors belonging to a failed organization
+    // could be treated as orphans and deleted.
+    if (successful) {
+        await persistence.cleanupOrphans();
+    }
+
+    const enrichedOrganizationsPath = path.resolve(
+        path.dirname(metadataPath),
+        'enriched-organizations.json'
+    );
+
+    const enrichedOrganizations = await readJsonFile(enrichedOrganizationsPath, []);
+    const artifactDir = path.dirname(metadataPath);
+    const caches = {
+        orgNames: await readJsonFile(path.join(artifactDir, 'github-id-and-orgnames.json'), {}),
+        repos: await readJsonFile(path.join(artifactDir, 'github-id-and-repos.json'), {}),
+        contributors: await readJsonFile(path.join(artifactDir, 'github-id-and-contributors.json'), {}),
+        commits: await readJsonFile(path.join(artifactDir, 'github-id-and-commits-count-hashmap.json'), {})
+    };
+
+    const gsocYears = metadata.gsocYears || [];
+
+    if (successful) {
+        await writeLegacyOutputs(
+            enrichedOrganizations,
+            gsocYears,
+            metadata.sourceTotals || {
+                categories: [],
+                topics: [],
+                technologies: []
+            },
+            caches
+        );
+    }
+
+    await finishSyncRun(
+        metadata.syncRunId,
+        successful ? 'SUCCESS' : 'FAILED',
+        processed,
+        successful
+            ? null
+            : JSON.stringify({
+                expected,
+                processed,
+                failures
+            }).slice(0, 10000)
+    );
+
+    if (!successful) {
+        throw new Error(
+            `Database synchronization incomplete: ${processed}/${expected} processed, ` +
+            `${failures.length} organization failures.`
+        );
+    }
+
+    console.log('\n========================================');
+    console.log('Database finalization completed successfully.');
+    console.log(`Organizations processed: ${processed}/${expected}`);
+    console.log('Global orphan cleanup completed.');
+    console.log('========================================');
+
+    await pool.end();
+}
+
+async function main() {
+    if (MODE === 'fetch') {
+        await compileDataFetch();
+        return;
+    }
+
+    if (MODE === 'persist') {
+        await persistBatchMode(PERSIST_BATCH_FILE);
+        return;
+    }
+
+    if (MODE === 'finalize') {
+        await finalizeMode();
+        return;
+    }
+
+    throw new Error(
+        'Usage: node index.js fetch | node index.js persist <batch-file> | node index.js finalize'
+    );
+}
+
+await main();
