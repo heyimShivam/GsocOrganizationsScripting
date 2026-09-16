@@ -8,18 +8,23 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ---------------------------------------------------------
-  # JOB 1: Fetch and enrich all organizations
-  # ---------------------------------------------------------
+
+  # =========================================================
+  # JOB 1
+  # Fetch all GSoC data + GitHub enrichment
+  # =========================================================
   fetch:
     name: Fetch + compile all GitHub data
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 360
 
     outputs:
       batches: ${{ steps.batches.outputs.batches }}
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -32,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Fetch and enrich organizations
+      - name: Fetch and compile
         env:
           ITHUB_TOKEN: ${{ secrets.ITHUB_TOKEN }}
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
@@ -41,60 +46,79 @@ jobs:
           WRITE_LEGACY_JSON: ${{ secrets.WRITE_LEGACY_JSON }}
 
           ACTIVITY_REPO_LIMIT: 3
-          ITHUBMIN_TIME_MS: 1000
+
+          ITHUBMIN_TIME_MS: 700
           ITHUB_MAX_CONCURRENT: 1
           MAX_GITHUB_RETRIES: 2
 
-          # Database batch size
           DB_BATCH_SIZE: 100
 
         run: node index.js fetch
 
+      # IMPORTANT:
+      # metadata.batches contains objects:
+      #
+      # [
+      #   { "file": "batch-000.json", "count": 100 },
+      #   { "file": "batch-001.json", "count": 100 }
+      # ]
+      #
+      # We extract ONLY the file names for the matrix.
       - name: Read batch manifest
         id: batches
         shell: bash
         run: |
-          node -e '
+          batches="$(node -e '
             const fs = require("fs");
 
             const metadata = JSON.parse(
               fs.readFileSync("output/metadata.json", "utf8")
             );
 
-            console.log(
-              "batches=" + JSON.stringify(metadata.batches)
-            );
-          ' >> "$GITHUB_OUTPUT"
+            const files = metadata.batches.map(batch => batch.file);
 
-      - name: Upload prepared organization data
+            process.stdout.write(JSON.stringify(files));
+          ')"
+
+          echo "Batches: $batches"
+
+          echo "batches=$batches" >> "$GITHUB_OUTPUT"
+
+      - name: Upload complete enriched dataset
         uses: actions/upload-artifact@v4
         with:
           name: enriched-organization-data
           path: output/
-          retention-days: 1
+          retention-days: 3
 
 
-  # ---------------------------------------------------------
-  # JOB 2: Persist each batch to PostgreSQL
-  # ---------------------------------------------------------
+  # =========================================================
+  # JOB 2
+  # Persist database batches
+  # =========================================================
   persist:
     name: Persist database batch
+
     needs: fetch
+
+    if: ${{ needs.fetch.result == 'success' }}
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
 
     strategy:
       fail-fast: false
 
+      # VERY IMPORTANT:
+      # Only one database batch runs at a time.
+      max-parallel: 1
+
       matrix:
         batch: ${{ fromJSON(needs.fetch.outputs.batches) }}
 
-      # IMPORTANT:
-      # Only one batch writes to the database at a time.
-      max-parallel: 1
-
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -107,47 +131,57 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Download prepared organization data
+      - name: Download prepared data
         uses: actions/download-artifact@v4
         with:
           name: enriched-organization-data
-          path: output
+          path: output/
 
-      - name: Persist batch
+      - name: Show batch being processed
+        run: |
+          echo "Processing batch:"
+          echo "${{ matrix.batch }}"
+
+      - name: Persist batch to Neon
         env:
-          # This job only needs the database.
-          # No GitHub API token is required here.
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
 
         run: |
           node index.js persist "output/batches/${{ matrix.batch }}"
 
       - name: Upload batch result
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: batch-result-${{ matrix.batch }}
           path: output/batches/*-result.json
-          retention-days: 1
+          if-no-files-found: ignore
+          retention-days: 3
 
 
-  # ---------------------------------------------------------
-  # JOB 3: Finalize sync
-  # ---------------------------------------------------------
+  # =========================================================
+  # JOB 3
+  # Verify everything + final cleanup
+  # =========================================================
   finalize:
-    name: Finalize GSoC sync
+    name: Finalize sync + cleanup
+
     needs:
       - fetch
       - persist
 
-    # Run even if a persist job failed, so finalize can inspect
-    # the batch results. It will only perform orphan cleanup
-    # when ALL batches succeeded.
+    # Run even when persist has failures.
+    #
+    # finalize itself checks whether ALL batches succeeded.
+    # Cleanup is only performed when everything succeeded.
     if: ${{ always() && needs.fetch.result == 'success' }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+
+    timeout-minutes: 60
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -160,24 +194,29 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Download prepared organization data
+      - name: Download prepared data
         uses: actions/download-artifact@v4
         with:
           name: enriched-organization-data
-          path: output
+          path: output/
 
-      - name: Download all batch results
+      - name: Download batch results
         uses: actions/download-artifact@v4
         with:
           pattern: batch-result-*
-          path: output/batches
+          path: output/batch-results/
           merge-multiple: true
 
-      - name: Finalize sync
+      - name: Show downloaded batch results
+        run: |
+          echo "Batch results:"
+          find output/batch-results -type f -maxdepth 1 -print || true
+
+      - name: Finalize database sync
         env:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
 
           PIPELINE_METADATA: output/metadata.json
-          BATCH_RESULT_DIR: output/batches
+          BATCH_RESULT_DIR: output/batch-results/
 
         run: node index.js finalize
