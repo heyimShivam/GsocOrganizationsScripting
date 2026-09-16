@@ -8,8 +8,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  refresh:
+  # ---------------------------------------------------------
+  # JOB 1: Fetch and enrich all organizations
+  # ---------------------------------------------------------
+  fetch:
+    name: Fetch + compile all GitHub data
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    outputs:
+      batches: ${{ steps.batches.outputs.batches }}
 
     steps:
       - name: Checkout repository
@@ -24,17 +32,152 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run GSoC compiler
+      - name: Fetch and enrich organizations
         env:
-          ITHUB_TOKEN: ${{ secrets.ITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          USE_OLD_RECORDS: ${{secrets.USE_OLD_RECORDS}}
-          WRITE_LEGACY_JSON: ${{secrets.WRITE_LEGACY_JSON}}
 
-          MIN_TIME_MS: 1000
+          USE_OLD_RECORDS: ${{ secrets.USE_OLD_RECORDS }}
+          WRITE_LEGACY_JSON: ${{ secrets.WRITE_LEGACY_JSON }}
+
           ACTIVITY_REPO_LIMIT: 3
-          ITHUBMIN_TIME_MS: 1000
-          ITHUB_MAX_CONCURRENT: 1
+          GITHUB_MIN_TIME_MS: 1000
+          GITHUB_MAX_CONCURRENT: 1
           MAX_GITHUB_RETRIES: 2
 
-        run: node index.js
+          # Database batch size
+          DB_BATCH_SIZE: 100
+
+        run: node index.js fetch
+
+      - name: Read batch manifest
+        id: batches
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+
+            const metadata = JSON.parse(
+              fs.readFileSync("output/metadata.json", "utf8")
+            );
+
+            console.log(
+              "batches=" + JSON.stringify(metadata.batches)
+            );
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Upload prepared organization data
+        uses: actions/upload-artifact@v4
+        with:
+          name: enriched-organization-data
+          path: output/
+          retention-days: 1
+
+
+  # ---------------------------------------------------------
+  # JOB 2: Persist each batch to PostgreSQL
+  # ---------------------------------------------------------
+  persist:
+    name: Persist database batch
+    needs: fetch
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        batch: ${{ fromJSON(needs.fetch.outputs.batches) }}
+
+      # IMPORTANT:
+      # Only one batch writes to the database at a time.
+      max-parallel: 1
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download prepared organization data
+        uses: actions/download-artifact@v4
+        with:
+          name: enriched-organization-data
+          path: output
+
+      - name: Persist batch
+        env:
+          # This job only needs the database.
+          # No GitHub API token is required here.
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+
+        run: |
+          node index.js persist "output/batches/${{ matrix.batch }}"
+
+      - name: Upload batch result
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-result-${{ matrix.batch }}
+          path: output/batches/*-result.json
+          retention-days: 1
+
+
+  # ---------------------------------------------------------
+  # JOB 3: Finalize sync
+  # ---------------------------------------------------------
+  finalize:
+    name: Finalize GSoC sync
+    needs:
+      - fetch
+      - persist
+
+    # Run even if a persist job failed, so finalize can inspect
+    # the batch results. It will only perform orphan cleanup
+    # when ALL batches succeeded.
+    if: ${{ always() && needs.fetch.result == 'success' }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download prepared organization data
+        uses: actions/download-artifact@v4
+        with:
+          name: enriched-organization-data
+          path: output
+
+      - name: Download all batch results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: batch-result-*
+          path: output/batches
+          merge-multiple: true
+
+      - name: Finalize sync
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+
+          PIPELINE_METADATA: output/metadata.json
+          BATCH_RESULT_DIR: output/batches
+
+        run: node index.js finalize
