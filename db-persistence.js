@@ -160,65 +160,34 @@ async function upsertOrganization(client, org) {
     const githubId = normalizeGithubId(org.githubID);
     const name = String(org.name ?? '').trim();
 
-    let existing = null;
-
-    if (githubId) {
-        const byGithub = await client.query(
-            `SELECT id, name, github_id
-             FROM organizations
-             WHERE LOWER(github_id) = LOWER($1)
-             ORDER BY updated_at DESC
-             LIMIT 2`,
-            [githubId]
-        );
-
-        if (byGithub.rows.length > 1) {
-            throw new Error(
-                `Ambiguous organization identity for ${name}: multiple database rows use github_id=${githubId}.`
-            );
-        }
-
-        existing = byGithub.rows[0] || null;
-
-        if (!existing) {
-            const byOldName = await client.query(
-                `SELECT id, name, github_id
-                 FROM organizations
-                 WHERE LOWER(name) = LOWER($1)
-                   AND github_id IS NULL
-                 LIMIT 1`,
-                [name]
-            );
-            existing = byOldName.rows[0] || null;
-        }
-    } else {
-        const byName = await client.query(
-            `SELECT id, name, github_id
-             FROM organizations
-             WHERE LOWER(name) = LOWER($1)
-             ORDER BY github_id NULLS LAST
-             LIMIT 2`,
-            [name]
-        );
-
-        if (byName.rows.length > 1) {
-            throw new Error(
-                `Ambiguous organization identity for ${name}: githubID is unavailable but multiple rows share this name.`
-            );
-        }
-
-        existing = byName.rows[0] || null;
+    if (!name) {
+        throw new Error('Organization name is required.');
     }
 
-    const values = [
-        name,
-        cleanText(org.image_url),
-        cleanText(org.image_background_color),
-        cleanText(org.description),
-        cleanText(org.url),
-        githubId,
-        Boolean(org.activeOrg)
-    ];
+    // Organization identity is the normalized GSoC organization name + GitHub ID.
+    // GitHub IDs are NOT unique across GSoC organizations (for example, several
+    // organizations can legitimately map to the same GitHub organization).
+    const byIdentity = await client.query(
+        `SELECT id, name, github_id
+         FROM organizations
+         WHERE LOWER(name) = LOWER($1)
+           AND (
+               ($2::text IS NULL AND github_id IS NULL)
+               OR LOWER(github_id) = LOWER($2::text)
+           )
+         ORDER BY updated_at DESC
+         LIMIT 2`,
+        [name, githubId]
+    );
+
+    if (byIdentity.rows.length > 1) {
+        throw new Error(
+            `Ambiguous organization identity for ${name}: ` +
+            `multiple database rows share name + github_id.`
+        );
+    }
+
+    const existing = byIdentity.rows[0] || null;
 
     if (existing) {
         const result = await client.query(
@@ -228,24 +197,49 @@ async function upsertOrganization(client, org) {
                  image_background_color = $4,
                  description = $5,
                  url = $6,
-                 github_id = COALESCE($7, github_id),
+                 github_id = $7,
                  active_org = $8,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $1
              RETURNING id`,
-            [existing.id, ...values]
+            [
+                existing.id,
+                name,
+                cleanText(org.image_url),
+                cleanText(org.image_background_color),
+                cleanText(org.description),
+                cleanText(org.url),
+                githubId,
+                Boolean(org.activeOrg)
+            ]
         );
+
         return result.rows[0].id;
     }
 
+    // No exact name + GitHub ID identity exists. Create a new organization,
+    // even when another organization already uses the same GitHub ID.
     const result = await client.query(
         `INSERT INTO organizations (
-             name, image_url, image_background_color, description,
-             url, github_id, active_org
+             name,
+             image_url,
+             image_background_color,
+             description,
+             url,
+             github_id,
+             active_org
          )
          VALUES ($1,$2,$3,$4,$5,$6,$7)
          RETURNING id`,
-        values
+        [
+            name,
+            cleanText(org.image_url),
+            cleanText(org.image_background_color),
+            cleanText(org.description),
+            cleanText(org.url),
+            githubId,
+            Boolean(org.activeOrg)
+        ]
     );
 
     return result.rows[0].id;
@@ -661,7 +655,7 @@ export function createPersistenceService(pool) {
             } catch (error) {
                 try {
                     await client.query('ROLLBACK');
-                } catch {}
+                } catch { }
                 throw error;
             } finally {
                 client.release();

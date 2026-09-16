@@ -663,10 +663,11 @@ function databaseIdentityKey(org) {
     const name = String(org.name ?? '').trim().toLowerCase();
     const githubID = normalizeGithubId(org.githubID);
 
-    // GitHub ID is the stable identity. If the organization changes its
-    // displayed GSoC name, it must still resolve to the same organization.
-    // When no GitHub ID exists, fall back to the normalized organization name.
-    return githubID ? `github::${githubID.toLowerCase()}` : `name::${name}`;
+    if (githubID) {
+        return `org::${name}::github::${githubID.toLowerCase()}`;
+    }
+
+    return `org::${name}`;
 }
 
 function projectIdentity(project) {

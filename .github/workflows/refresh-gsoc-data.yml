@@ -47,7 +47,7 @@ jobs:
 
           ACTIVITY_REPO_LIMIT: 3
 
-          ITHUBMIN_TIME_MS: 700
+          ITHUBMIN_TIME_MS: 400
           ITHUB_MAX_CONCURRENT: 1
           MAX_GITHUB_RETRIES: 2
 
